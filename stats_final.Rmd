@@ -1,0 +1,286 @@
+---
+title: "stats"
+author: "Telma Peura"
+date: "15.12.2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(tidytext)
+library(textstem)
+```
+
+# Data preparation
+```{r}
+# read in data
+path="/mnt/sda7/conspiracy/code/NYTBooks/data"
+
+list_of_files <- list.files(path = path, recursive = TRUE,
+                            #pattern = "\\.txt$", 
+                            full.names = TRUE)
+list_of_files <-list_of_files[-14]
+
+# load all data
+alldf <- list_of_files %>%
+  map_df(read_csv, col_types = c('primary_isbn13'="character", "list"="factor", "weeks_on_list"="numeric"))
+
+head(alldf)
+
+dates <- alldf %>%
+  group_by(list)%>%
+  filter(date >= "2018-03-11") %>% #2018-03-11
+  mutate(nr_lists = length(unique(date)))
+
+```
+
+# fiction
+
+```{r}
+alldf %>%
+  filter(grepl('-fiction', list)) %>%
+  group_by(list) %>%
+  filter(date >= "2018-03-11") %>%
+  summarise(weeks=n(), rank_mean=mean(rank),length(unique(date)) )
+
+
+fictiondf <- alldf %>%
+  filter(grepl('-fiction', list)) %>%
+#  group_by(list) %>%
+  group_by(title,list) %>%
+ # mutate(max_weeks = n())# %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>% 
+  mutate(lemmas=lemmatize_strings(description))#, std_weeks=sd(max_weeks), mean_weeks=mean(max_weeks))
+
+audio <- alldf %>%
+  filter(grepl('audio-fiction', list)) %>%
+#  group_by(list) %>%
+  group_by(title,list) %>%
+ # mutate(max_weeks = n())# %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) 
+
+# see total nr of books
+nrow(fictiondf[!duplicated(fictiondf[,c('title')]),])
+```
+
+# look at top book characteristics
+
+```{r}
+
+library(sjPlot)
+
+# top 20 in every fiction list
+fictiondf%>% 
+  arrange(desc(max_weeks)) %>% 
+  group_by(list) %>%
+  #group_by(cyl) %>% 
+  slice(1:20)
+
+# best-selling authors
+fictiondf <-fictiondf%>% 
+  #arrange(desc(max_weeks)) %>% 
+  group_by(list,author) %>%
+  mutate(books_per_author=n(), weeks_per_author=sum(max_weeks))
+  #group_by(cyl) %>% 
+ # slice(1:20)
+
+
+# make sure to remove dups
+fauthors <- fictiondf[!duplicated(fictiondf[,c('author')]),]
+
+books_authors <-fauthors%>% 
+  arrange(desc(books_per_author)) %>% 
+  group_by(list) %>%
+  #group_by(cyl) %>% 
+  slice(1:5) %>%
+  summarise(author=author, books_per_author=books_per_author, weeks_per_author=weeks_per_author)
+
+weeks_authors <- fauthors%>% 
+  arrange(desc(weeks_per_author)) %>% 
+  group_by(list) %>%
+  #group_by(cyl) %>% 
+  slice(1:5) %>%
+  summarise(author=author, books_per_author=books_per_author, weeks_per_author=weeks_per_author)
+tab_df(books_authors)
+
+# top 5 titles in nonfiction
+nonfiction_top5 <-alldf %>%
+  filter(grepl('nonfiction', list)) %>%
+#  group_by(list) %>%
+  group_by(title,list,author) %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>%
+   mutate(books_per_author=n(), weeks_per_author=sum(max_weeks)) %>%
+  arrange(desc(weeks_per_author)) %>%
+   group_by(list) %>%
+  slice(1:5) %>%
+  summarise(author=author, title=title, weeks_per_author=weeks_per_author)
+
+
+# top 5 titles in fiction
+fiction_top5 <- alldf %>%
+  filter(grepl('-fiction', list)) %>%
+  group_by(title, list,author) %>%
+  
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>%
+   mutate(books_per_author=n(), weeks_per_author=sum(max_weeks)) %>%
+  arrange(desc(weeks_per_author)) %>%
+   group_by(list) %>%
+  slice(1:5) %>%
+  summarise(author=author,weeks_per_author=weeks_per_author)
+ 
+tab_df(fiction_top5, col.header=c("List","Author","Title", "Weeks on list"))
+
+```
+
+
+# nice tables
+## how long on average does a book stay on a list?
+```{r}
+library(sjPlot)
+
+# get unique dates ==> number of new updates on list
+fictiondates <- fictiondf %>%
+  group_by(list) %>%
+  filter(grepl('-fiction', list)) %>%
+  summarise(dates=length(unique(date1)))
+
+nonfictiondates <- nonfictiondf %>%
+  group_by(list) %>%
+  filter(grepl('-nonfiction', list)) %>%
+  summarise(dates=length(unique(date1)))
+
+# fiction nr of changes on list
+week_nr <-fictiondf %>%
+  group_by(list) %>%
+  filter(date1 >= "2018-03-11") %>%
+  summarise(mean_weeks=mean(max_weeks), std_weeks=sd(max_weeks), authors=length(unique(author)))
+week_nr$mean_sd <- paste(round(week_nr$mean_weeks,3), " ", "(", round(week_nr$std_weeks,3), ")", sep = "")
+weekf <- select(week_nr, c(list,mean_sd, authors))
+weekf$listsnr <-fictiondates$dates
+weekfic <- weekf
+
+
+# same for nonfiction
+week_nr <-nonfictiondf %>%
+  group_by(list) %>%
+  filter(date1 >= "2018-03-11") %>%
+  summarise(mean_weeks=mean(max_weeks), std_weeks=sd(max_weeks), authors=length(unique(author)))
+week_nr$mean_sd <- paste(round(week_nr$mean_weeks,3), " ", "(", round(week_nr$std_weeks,3), ")", sep = "")
+weekf <- select(week_nr, c(list,mean_sd, authors))
+weekf$listsnr <-nonfictiondates$dates
+
+weeks <- rbind(weekfic, weekf)
+tab_df(weeks, col.header=c("List","Weeks on list (SD)", "Authors","Nr of list updates"), sort.column=1, alternate.rows=T)
+
+```
+
+
+# non-fiction
+
+```{r}
+
+alldf %>%
+  filter(grepl('nonfiction', list)) %>%
+  group_by(title,list) %>%
+  #mutate
+  summarise(weeks=n(), rank_mean=mean(rank) )
+
+
+nonfictiondf <- alldf %>%
+  filter(grepl('nonfiction', list)) %>%
+#  group_by(list) %>%
+  group_by(title,list) %>%
+ # mutate(max_weeks = n())# %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>% 
+  mutate(lemmas=lemmatize_strings(description))#, std_weeks=sd(max_weeks), mean_weeks=mean(max_weeks))
+
+
+
+```
+
+
+# compare fiction to nonfiction, only printed format
+```{r}
+library(lme4)
+library(ggplot2)
+library(tidyverse)
+library(sjPlot)
+
+printed <- alldf %>%
+  filter(grepl('fiction', list)) %>%
+  filter(!grepl('audio', list))
+
+# authors for both lists
+printed_authors<- printed %>%group_by(list,author) %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank))
+
+stats<-printed %>%group_by(list) %>%
+  summarise(authors = length(unique(author)), books=length(unique(title)))  
+tab_df(stats, alternate.rows = T)
+printed_authors$type <- ifelse(grepl('nonfiction', printed_authors$list),"nonfiction","fiction") 
+
+printed <-printed %>%group_by(title,list) %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>%
+  arrange(max_weeks)
+printed$type <- ifelse(grepl('nonfiction', printed$list),"nonfiction","fiction") 
+
+
+# long tails ==> most of the books stay on the list only a short time
+ggplot(printed, aes(max_weeks)) + 
+        geom_histogram(fill = "white", color = "grey30", binwidth = 2)+
+  facet_wrap(~list)
+
+
+```
+
+# statistical tests
+
+```{r}
+# mean time per title
+t.test(max_weeks ~ type, data = printed)
+
+# mean time per author
+t.test(max_weeks ~ type, data = printed_authors)
+
+sd(printed_authors$max_weeks[printed_authors$type==1], na.rm=F)
+```
+
+# Visualize
+
+## New titles on the list, over time (averaged per month)
+```{r}
+printed <- printed %>%
+  mutate(month= paste(str_extract(date1, '20[0-9]{2}-[0-9]{2}'),"01",sep="-"), year= str_extract(date1, '20[0-9]{2}')) %>%
+  arrange(month)
+printed$month <- as.Date(printed$month)#, tryFormats = c("%Y-%m", "%Y/%m/"))
+
+printedmonthly<-printed %>%
+  group_by(month,list)%>%
+  summarise(authors_month = length(unique(author)), titles_month=length(unique(title)), year=unique(year), type=unique(type))# %>%
+
+printedmonthly %>%
+  filter(year > "2016") %>%
+  ggplot(aes(month,authors_month,color=list)) +
+  geom_point(stat="identity", position="identity",size=1)+
+  geom_smooth( method="lm")+
+  facet_wrap(~type)+xlab("topic") +
+    theme_light()+
+    ylab("nr of authors per month")+
+  xlab("")+
+  theme(legend.position="bottom")
+
+
+printedmonthly %>%
+  filter(year > "2016") %>%
+  ggplot(aes(month,titles_month, color=list)) +
+    geom_point(stat='identity', position='identity', aes(colour=list),size=1)+
+  geom_smooth( method='lm')+
+  facet_wrap(~type)+  theme_light()+
+    ylab("nr of titles per month")+
+  xlab("")+
+  theme(legend.position="bottom")
+
+
+```
+

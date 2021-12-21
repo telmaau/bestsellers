@@ -1,0 +1,489 @@
+---
+title: "Topic modeling NYT Best Seller lists"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#
+library(tidyr)
+library(stm)
+library(tidyverse)
+library(tidytext)
+library(textstem)
+
+```
+
+## Data
+
+```{r data}
+# read in data
+path="/mnt/sda7/conspiracy/code/NYTBooks/data"
+
+list_of_files <- list.files(path = path, recursive = TRUE,
+                            #pattern = "\\.txt$", 
+                            full.names = TRUE)
+list_of_files <-list_of_files[-14]
+
+# read all csv files into one df
+alldf <- list_of_files %>%
+  map_df(read_csv, col_types = c('primary_isbn13'="character", "list"="factor", "weeks_on_list"="numeric"))
+
+
+# create one df with only fiction
+fictiondf <- alldf %>%
+  filter(grepl('-fiction', list)) %>%
+  group_by(title,list) %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>% 
+  mutate(lemmas=lemmatize_strings(description))
+
+# the same for nonfiction
+nonfictiondf <- alldf %>%
+  filter(grepl('nonfiction', list)) %>%
+  group_by(title,list) %>%
+  summarise(max_weeks=n(),description=max(description), author=unique(author), date1=min(date), date2=max(date), top_rank = min(rank), mean_rank=mean(rank)) %>% 
+  mutate(lemmas=lemmatize_strings(description))
+```
+
+```{r}
+library(dplyr)
+
+# remove Read by
+fictiondf <-fictiondf %>%
+  mutate(newdescription = strsplit(lemmas,split='Read by', fixed=TRUE)[[1]][1])
+
+
+# make a column that has all lists as one
+fdf<-fictiondf %>%
+  group_by(title,author) %>%
+  mutate(lists = toString(list)) %>%
+  ungroup
+
+nfdf<-nonfictiondf %>%
+  mutate(newdescription = strsplit(lemmas,split='Read by', fixed=TRUE)[[1]][1])%>%
+  group_by(title,author) %>%
+  mutate(lists = toString(list)) %>%
+  ungroup
+
+# see the different groupings:
+unique(nfdf$lists)
+```
+
+
+```{r}
+# stopwords
+stops = dplyr::filter(stop_words,lexicon=="SMART")
+stops2 = dplyr::filter(stop_words,lexicon=="snowball")
+mystopwords = stops2$word 
+
+# Add custom stopwords
+mystopwords=append(mystopwords,c("s","d","m","ll", "hour","minute","unabridged"))
+```
+
+
+# fiction data for topic model
+```{r}
+# unique titles
+data <- fdf[!duplicated(fdf[,c('title',"author")]),]
+
+# select a subset of columns
+data <- data[,c("title","lists","date1","author","newdescription", "description")]
+data$author <- factor(data$author)
+data$lists <- factor(data$lists)
+
+# description length
+sum(nchar(data$newdescription), na.rm=T)/length(data$newdescription)
+```
+
+
+# with stm package steps
+```{r}
+library(tm)
+library(quanteda)
+library(stm)
+
+processed <- textProcessor(data$newdescription, metadata = data, stem=F, removenumbers=T,removestopwords = F, customstopwords	=mystopwords)
+
+myout <- prepDocuments(processed$documents, processed$vocab, processed$meta, lower.thresh	=3) # the word needs to appear at least in three book descriptions
+
+mydocs <- myout$documents
+myvocab <- myout$vocab
+mymeta <-myout$meta
+
+# plot to set a threshold
+plotRemoved(processed$documents, lower.thresh = seq(1, 150, by = 5))
+```
+
+```{r}
+# see the head of the vocabulary
+myout$vocab[1:10]
+```
+
+# K search for nr of topics
+
+To estimate the number of topics, I decided to run this K search. 
+```{r}
+storage <- searchK(myout$documents, myout$vocab, K = c(3,5,7,10,15), data = mymeta, max.em.its=100) #,prevalence =~ mean_rank
+plot(storage)
+# look at high held-out likelihood, low residuals
+```
+It looks like 5 or 7 topics might be optimal for finding topics
+
+I also decided to look at semantic coherence VS the exclusivity of the topics. 
+```{r}
+kresults <-storage$results 
+kresults%>%
+  select(K, exclus, semcoh) %>%
+  filter(K %in% c(3,5,7, 10, 15,20)) %>%
+ # unnest() %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semcoh, exclus, color = K)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity",
+       title = "Comparing exclusivity and semantic coherence",
+       subtitle = "Models with fewer topics have higher semantic coherence for more topics, but lower exclusivity")
+```
+
+
+# generate different topic models, with and without prevalence
+```{r include=FALSE}
+bookPrevFit <- stm(documents = myout$documents, vocab = myout$vocab, K = 7, max.em.its = 200, data = myout$meta, init.type = "Spectral", seed=99)
+
+
+bookPrevFit_5 <- stm(documents = myout$documents, vocab = myout$vocab, K =5,  max.em.its = 200, data = myout$meta, init.type = "Spectral", seed=99)
+
+bookPrevFit_pre <- stm(documents = myout$documents, vocab = myout$vocab,prevalence=~ lists, K =7,  max.em.its = 150, data = myout$meta, init.type = "Spectral", gamma.prior='L1', seed=99)
+
+bookPrevFit_pre5 <- stm(documents = myout$documents, vocab = myout$vocab,prevalence=~ lists, K =5,  max.em.its = 150, data = myout$meta, init.type = "Spectral", gamma.prior='L1', seed=99)
+```
+
+## Evaluate models
+1. Displaying words associated with topics (labelTopics, plot.STM(,type = "labels"),
+sageLabels, plot.STM(,type = "perspectives")) or documents highly associated
+with particular topics (findThoughts, plotQuote).
+2. Estimating relationships between metadata and topics/topical content (estimateEffect).
+3. Calculating topic correlations (topicCorr).
+
+### labetopics
+- prob	matrix of highest probability words
+
+- frex	matrix of highest ranking frex words
+
+- lift	matrix of highest scoring words by lift
+
+- score	matrix of best words by score
+
+```{r}
+labelTopics(bookPrevFit)
+```
+
+```{r}
+labelTopics(bookPrevFit_pre)
+```
+
+```{r}
+labelTopics(bookPrevFit_5)
+```
+
+### contrast two topics
+```{r}
+plot.STM(bookPrevFit_pre, type="perspectives", topics=c(1,4))
+```
+
+## estimated effect of lists
+```{r}
+# estimated effect of lists
+myout$meta$lists <- as.factor(myout$meta$lists)
+prep <- estimateEffect(1:7 ~ lists, bookPrevFit, meta = myout$meta, uncertainty = "Global")
+summary(prep, topics=1)
+
+```
+
+# Visualize
+```{r}
+
+plot(bookPrevFit_pre, type="summary", xlim = c(0, .4))
+
+```
+
+
+### topic connectedness
+```{r}
+library(igraph)
+mod.out.corr <- topicCorr(bookPrevFit_pre)
+plot(mod.out.corr)
+
+```
+
+
+
+
+```{r}
+library(tidytext)
+
+td_beta <- tidytext::tidy(bookPrevFit_pre)
+
+td_beta %>%
+    group_by(topic) %>%
+    top_n(15, beta) %>%
+    ungroup() %>%
+    mutate(topic = paste0("Topic ", topic),
+           term = reorder_within(term, beta, topic)) %>%
+    ggplot(aes(term, beta, fill = as.factor(topic))) +
+    geom_col(alpha = 0.8, show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free_y") +
+    coord_flip() +
+    scale_x_reordered() +
+    labs(x = NULL, y = expression(beta),
+         title = "Highest word probabilities for each topic",
+         subtitle = "Add model description")
+```
+
+# Are there topics that correlate in audio?
+
+```{r}
+# get probabilities associated with topics
+probs <- tidy(bookPrevFit_pre, matrix = "gamma")
+probs
+probs %>%
+  group_by(document)%>%
+  summarise(n(),title=mymeta$title)
+
+mymeta$docid <- 1:nrow(mymeta)
+topics_per_doc<-merge(probs, mymeta, by.x = "document", by.y="docid")
+chars="audio"
+topics_per_doc$format <- factor(ifelse(grepl( chars,topics_per_doc$lists, fixed=T)==T,  1,0))
+head(topics_per_doc)# %>%
+topics_per_doc$topic <- as.factor(topics_per_doc$topic)
+```
+
+
+## mean probabilities per topic for audio and text format
+```{r}
+# filter only the audio type period:
+subtopics<- subset(topics_per_doc, date1> "2018-01-30")
+
+# group by topic
+mysummary<-subtopics %>%
+  group_by(topic,format) %>%
+  summarise(mean=mean(gamma),sd= sd(gamma))
+mysummary$mean_sd <- paste(round(mysummary$mean,3), " ", "(", round(mysummary$sd,3), ")", sep = "")
+
+# change 1 and 0 to  "text" and "audio"
+mysummary$format2 <- ifelse(mysummary$format == 0, "text","audio")
+mysummary <- select(mysummary, c(topic, format2,mean_sd))
+tab_df(mysummary, alternate.rows=T, col.header=c("topic","format","mean probability (SD)"))
+```
+
+
+- i.e. does format (text, audio, both) predict topic probability?
+```{r}
+library(lme4)
+#model <- glm(format ~.,family=binomial(link='logit'),data=topics_per_doc)
+
+audio <- subtopics %>%
+  filter(lists =="audio-fiction")%>%
+  mutate(type="audio")
+text <-  subtopics %>%
+  filter(!grepl('audio', lists))%>%
+  mutate(type="text")
+combi <-subtopics %>%
+  filter(grepl('audio', lists)) %>%
+  filter(lists!="audio-fiction")%>%
+  mutate(type="combi")
+
+newdf <- rbind(audio,text)
+newdf <- rbind(newdf,combi)
+
+
+res_aov <- aov(gamma~ topic*type,
+  data = newdf
+)
+null_aov <- aov(gamma~ topic,
+  data = newdf
+)
+anova(null_aov,res_aov)
+summary(res_aov)
+
+
+```
+
+predict values
+```{r}
+data.frame(predict.lm(model3, interval = "prediction"))
+
+pred <- data.frame(predict.lm(model3, interval = "prediction"))
+newdf$pred <- pred$fit
+newdf$pred_lwr <- pred$lwr
+newdf$pred_upr <- pred$upr
+
+```
+
+## Visualize 
+Plot the actual data with computeed topic distributions
+```{r}
+library(ggplot2)
+
+pd <- position_dodge(0.8) # move them .8 to the left and right
+mylabels = c("audio","audio-text","audio-text-hardcover", "audio-text-hardcover-paperback",  "audio-text-paperback","audio-hardcover", "audio-paperback","text","text-hardcover","text-hardcover-paperback","text-paperback","hardcover","hardcover-paperback","paperback")
+
+# define colors
+mycolors= colorspace::terrain_hcl(9) 
+mycolors = mycolors[1:7]
+length(mycolors)
+mycolors=  append(mycolors,colorspace::sequential_hcl(8))
+mycolors
+
+real_plt <-subtopics %>%
+  group_by(lists) %>%
+  #fdf[!duplicated(fdf[,c('title')]),]
+  ggplot( aes(x=topic, y=gamma, color=lists, fill=lists)) + 
+    geom_boxplot(position=pd) +
+   # geom_errorbar(aes(ymin=pred_lwr, ymax=pred_upr), width=.1, position=pd) +
+    xlab("topic") +
+    theme_light()+
+    ylab("topic probability")+
+    ggtitle("Topic probabilites per book format")
+
+real_plt
+# add colors and labels
+real_plt+
+  theme(legend.position="bottom")+
+  scale_color_manual(name = "Format", labels = mylabels, values=mycolors)+
+scale_fill_manual(name = "Format", labels = mylabels, values=mycolors)
+
+
+
+```
+
+Plot model predictions
+```{r echo=FALSE}
+
+# 
+pd <- position_dodge(0.8) # move them .8 to the left and right
+mylabels = c("audio","audio-text","audio-text-hardcover", "audio-text-hardcover-paperback", "audio-text-paperback", "audio-hardcover", "audio-paperback","text","text-hardcover","text-hardcover-paperback","text-paperback","hardcover","hardcover-paperback","paperback")
+
+# define colors
+mycolors= colorspace::terrain_hcl(9) 
+mycolors = mycolors[1:7]
+length(mycolors)
+mycolors=  append(mycolors,colorspace::sequential_hcl(8))
+mycolors
+
+pred_plt <-subtopics %>%
+  group_by(pred) %>%
+  #fdf[!duplicated(fdf[,c('title')]),]
+  ggplot( aes(x=topic, y=pred, color=lists)) + 
+    geom_point(position=pd) +
+    geom_errorbar(aes(ymin=pred_lwr, ymax=pred_upr), width=.1, position=pd) +
+    xlab("topic") +
+    theme_light()+
+    ylab("topic probability")+
+    ggtitle("Topic probabilites per book format")
+  
+# add colors and labels
+pred_plt+
+  theme(legend.position="bottom")+
+  scale_color_manual(name = "Format", labels = mylabels, values=mycolors)
+
+
+pred_plt2 <-newdf %>%
+  group_by(pred) %>%
+  #fdf[!duplicated(fdf[,c('title')]),]
+  ggplot( aes(x=topic, y=pred, color=type)) + 
+    geom_point(position=pd) +
+    geom_errorbar(aes(ymin=pred_lwr, ymax=pred_upr), width=.4, position=pd) +
+    xlab("topic") +
+    theme_light()+
+    ylab("topic probability")+
+    ggtitle("Topic probabilites per book format")
+pred_plt2+
+  theme(legend.position="bottom")+
+  scale_color_manual(name = "Format", labels = c("audio","both","text"), values=mycolors[c(1,4,8)])
+
+```
+
+# see most probable books per topic
+```{r}
+
+# top 5
+topdf <- subtopics %>%
+  group_by(topic) %>%
+  top_n(5, gamma) %>%
+  arrange(topic)
+
+# select only relevant columns
+subtob <- topdf %>%
+  select(topic,gamma,title, author)
+
+```
+
+## looking at topic 3
+
+```{r}
+library(gt)
+topic3 <- subtopics %>%
+  filter(topic==3) %>%
+  top_n(10, gamma) %>%
+  arrange(desc(gamma)) %>%
+  select(gamma, title, author, description)
+tab_df(head(topic3))
+
+topic3 %>%
+  gt() %>%
+  tab_style(
+    style = list(
+      cell_text(size = "small")
+      ),
+    locations = cells_body(
+      columns = description
+    
+    ))
+
+```
+
+## Top title for each topic
+```{r}
+tab_1 <-
+  subtob %>%
+ # dplyr::select(gamma, topic, title) %>%
+  gt() %>%
+  fmt_number(
+    columns = c(gamma, topic),
+    decimals = 2
+  ) %>%
+  tab_style(
+    style = list(
+      cell_fill(color = "lightcyan"),
+      cell_text(weight = "bold")
+      ),
+    locations = cells_body(
+      columns = gamma,
+      rows = gamma >= 5000
+    )
+  ) %>%
+  tab_style(
+    style = list(
+      cell_fill(color = "#F9E3D6"),
+      cell_text(style = "italic")
+      ),
+    locations = cells_body(
+      columns = topic,
+      rows = gamma >0.50
+    )
+  )
+tab_1
+
+
+```
+
+
+## Wordcloud for fun
+```{r pressure, echo=FALSE}
+library(wordcloud)
+
+cloud(bookPrevFit_pre, topic = 3, scale = c(2,.25))
+```
+
